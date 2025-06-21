@@ -1,0 +1,24 @@
+name: build
+
+on: [push]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: install
+      run: >
+        sudo apt-get update && sudo apt-get --no-install-recommends -y install
+        cmake
+    - name: build
+      run: >
+        mkdir cmake ;
+        cd cmake ;
+        cmake .. -DENABLE_TESTS=true ;
+        make -j$(nproc);
+        run-parts ./tests/
