@@ -538,7 +538,6 @@ int IceAgent::connectivity_check() {
         LOGD("send binding request to remote ip: %s, port: %d", addr_string, remote_addr.port);
         create_binding_request(&msg);
         socket_send(&remote_addr, msg.buf, msg.size);
-        binding_request_time_ = ports_get_epoch_time(); // Update time when sending keepalive
     }
 
     recv(buf, sizeof(buf));

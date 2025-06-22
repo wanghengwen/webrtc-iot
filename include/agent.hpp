@@ -92,7 +92,6 @@ public:
     
     // Setters
     void set_mode(AgentMode mode) { mode_ = mode; }
-    void update_binding_request_time() { binding_request_time_ = ports_get_epoch_time(); }
     
     // Get remote address from nominated or selected pair
     Address* get_nominated_remote_addr() const {

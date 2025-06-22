@@ -51,7 +51,9 @@ PeerConnection::PeerConnection()
     , local_description_created_(false)
     , dtls_handshake_delay_counter_(0)
     , remote_assrc_(0)
-    , remote_vssrc_(0) {
+    , remote_vssrc_(0)
+    , next_keepalive_time_(0)
+    , time_of_last_activity_(0) {
     
     initialize_peer_library();
     
@@ -91,6 +93,8 @@ PeerConnection::PeerConnection(PeerConnection&& other) noexcept
     , artp_decoder_(std::move(other.artp_decoder_))
     , remote_assrc_(other.remote_assrc_)
     , remote_vssrc_(other.remote_vssrc_)
+    , next_keepalive_time_(other.next_keepalive_time_)
+    , time_of_last_activity_(other.time_of_last_activity_)
     , on_ice_candidate_(std::move(other.on_ice_candidate_))
     , on_ice_connection_state_change_(std::move(other.on_ice_connection_state_change_))
     , on_receiver_packet_loss_(std::move(other.on_receiver_packet_loss_))
@@ -132,6 +136,7 @@ PeerConnection& PeerConnection::operator=(PeerConnection&& other) noexcept {
         artp_decoder_ = std::move(other.artp_decoder_);
         remote_assrc_ = other.remote_assrc_;
         remote_vssrc_ = other.remote_vssrc_;
+        next_keepalive_time_ = other.next_keepalive_time_;
         on_ice_candidate_ = std::move(other.on_ice_candidate_);
         on_ice_connection_state_change_ = std::move(other.on_ice_connection_state_change_);
         on_receiver_packet_loss_ = std::move(other.on_receiver_packet_loss_);
@@ -239,6 +244,11 @@ const std::string& PeerConnection::state_to_string() const {
 
 void PeerConnection::state_changed(PeerConnectionState new_state) {
     if (on_ice_connection_state_change_ && state_ != new_state) {
+        // Reset keepalive timer when leaving COMPLETED state
+        if (state_ == PeerConnectionState::COMPLETED && new_state != PeerConnectionState::COMPLETED) {
+            next_keepalive_time_ = 0;
+        }
+        
         on_ice_connection_state_change_(new_state);
         state_ = new_state;
     }
@@ -248,6 +258,7 @@ int PeerConnection::loop() {
     uint32_t ssrc = 0;
     memset(agent_buf_, 0, sizeof(agent_buf_));
     agent_ret_ = -1;
+    uint64_t current_time = ports_get_epoch_time();
     
     switch (state_) {
         case PeerConnectionState::NEW:
@@ -294,7 +305,7 @@ int PeerConnection::loop() {
                         dtls_handshake_delay_counter_ = 100; // Force completion check
                     } else {
                         // Other errors - small delay and continue
-                        ports_sleep_ms(1);
+                        ports_sleep_ms(10);
                     }
                 } else {
                     LOGI("DTLS handshake attempts exceeded, checking if DTLS completed anyway");
@@ -340,23 +351,28 @@ int PeerConnection::loop() {
         }
             
         case PeerConnectionState::COMPLETED: {
-            // Check if we need to send keepalive
-            uint64_t current_time = ports_get_epoch_time();
-            uint64_t time_since_last_activity = current_time - agent_.get_binding_request_time();
+            if (agent_.get_binding_request_time() > time_of_last_activity_) {
+                time_of_last_activity_ = agent_.get_binding_request_time();
+            }
+
+            // Initialize keepalive timer on first entry to COMPLETED state
+            if (next_keepalive_time_ == 0) {
+                next_keepalive_time_ = current_time + 5000; // First keepalive in 5 seconds
+            }
             
-            // If no activity for 8 seconds (before 10s timeout), send keepalive
-            if (time_since_last_activity > 8000) {
-                LOGD("Sending ICE keepalive after %llu ms of inactivity", 
-                     (unsigned long long)time_since_last_activity);
+            // Check if it's time to send keepalive
+            if (current_time >= next_keepalive_time_) {
                 agent_.connectivity_check();
+                
+                // Schedule next keepalive in 5 seconds regardless
+                next_keepalive_time_ = current_time + 5000;
             }
             
             if ((agent_ret_ = agent_.recv(agent_buf_, sizeof(agent_buf_))) > 0) {
                 LOGD("agent_recv %d", agent_ret_);
-                
-                // Update binding request time when receiving any valid data
-                // This indicates the connection is still active
-                agent_.update_binding_request_time();
+                // schedule next keepalive in 5 seconds
+                next_keepalive_time_ = current_time + 5000;
+                time_of_last_activity_ = current_time ;
                 
                 if (rtc::RtcpProcessor::probe(agent_buf_, agent_ret_)) {
                     LOGD("Got RTCP packet");
@@ -366,7 +382,7 @@ int PeerConnection::loop() {
                 } else if (rtc::DtlsSrtpSession::probe(agent_buf_)) {
                     int ret = dtls_srtp_.read(temp_buf_, sizeof(temp_buf_));
                     LOGD("Got DTLS data %d", ret);
-                    
+                   
 #if CONFIG_ENABLE_DATACHANNEL
                     if (ret > 0 && sctp_) {
                         sctp_->incoming_data(reinterpret_cast<char*>(temp_buf_), ret);
@@ -398,10 +414,10 @@ int PeerConnection::loop() {
                          agent_ret_, agent_buf_[0], agent_buf_[1]);
                 }
             }
-            
+
             if (CONFIG_KEEPALIVE_TIMEOUT > 0 && 
-                (ports_get_epoch_time() - agent_.get_binding_request_time()) > CONFIG_KEEPALIVE_TIMEOUT) {
-                LOGI("binding request timeout");
+                (current_time - time_of_last_activity_) > CONFIG_KEEPALIVE_TIMEOUT) {
+                LOGI("keepalive timeout");
                 state_changed(PeerConnectionState::CLOSED);
             }
             break;

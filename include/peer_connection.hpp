@@ -169,6 +169,10 @@ private:
     uint32_t remote_assrc_;
     uint32_t remote_vssrc_;
     
+    // Keepalive management
+    uint64_t next_keepalive_time_;
+    uint64_t time_of_last_activity_;
+    
     // Callback functions
     std::function<void(const std::string& sdp)> on_ice_candidate_;
     std::function<void(PeerConnectionState state)> on_ice_connection_state_change_;
