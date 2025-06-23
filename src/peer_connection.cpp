@@ -258,7 +258,7 @@ int PeerConnection::loop() {
     uint32_t ssrc = 0;
     memset(agent_buf_, 0, sizeof(agent_buf_));
     agent_ret_ = -1;
-    uint64_t current_time = ports_get_epoch_time();
+    uint32_t current_time = ports_get_epoch_time();
     
     switch (state_) {
         case PeerConnectionState::NEW:
@@ -369,19 +369,19 @@ int PeerConnection::loop() {
             }
             
             if ((agent_ret_ = agent_.recv(agent_buf_, sizeof(agent_buf_))) > 0) {
-                LOGD("agent_recv %d", agent_ret_);
+                LOGD("[%u]agent_recv %d", current_time, agent_ret_);
                 // schedule next keepalive in 5 seconds
                 next_keepalive_time_ = current_time + 5000;
                 time_of_last_activity_ = current_time ;
                 
                 if (rtc::RtcpProcessor::probe(agent_buf_, agent_ret_)) {
-                    LOGD("Got RTCP packet");
+                    LOGD("[%u]Got RTCP packet", current_time);
                     dtls_srtp_.decrypt_rtcp_packet(agent_buf_, &agent_ret_);
                     incoming_rtcp(agent_buf_, agent_ret_);
                     
                 } else if (rtc::DtlsSrtpSession::probe(agent_buf_)) {
                     int ret = dtls_srtp_.read(temp_buf_, sizeof(temp_buf_));
-                    LOGD("Got DTLS data %d", ret);
+                    LOGD("[%u]Got DTLS data %d", current_time, ret);
                    
 #if CONFIG_ENABLE_DATACHANNEL
                     if (ret > 0 && sctp_) {
@@ -389,37 +389,41 @@ int PeerConnection::loop() {
                     }
 #endif
                 } else if (rtc::RtpProcessor::validate_packet(agent_buf_, agent_ret_)) {
-                    LOGD("Got RTP packet, size: %d", agent_ret_);
+                    LOGD("[%u]Got RTP packet, size: %d", current_time, agent_ret_);
                     
-                    LOGD("Decrypting RTP packet");
+                    LOGD("[%u]Decrypting RTP packet", current_time);
                     dtls_srtp_.decrypt_rtp_packet(agent_buf_, &agent_ret_);
-                    LOGD("RTP packet decrypted, new size: %d", agent_ret_);
+                    LOGD("[%u]RTP packet decrypted, new size: %d", current_time, agent_ret_);
                     
                     ssrc = rtc::RtpProcessor::get_ssrc(agent_buf_);
                     LOGD("Received RTP packet with SSRC: %u, remote_assrc: %u, remote_vssrc: %u", 
                          ssrc, remote_assrc_, remote_vssrc_);
                     if (ssrc == remote_assrc_ && artp_decoder_) {
-                        LOGD("Decoding audio RTP packet");
+                        LOGD("[%u]Decoding audio RTP packet", current_time);
                         artp_decoder_->decode(agent_buf_, agent_ret_);
                     } else if (ssrc == remote_vssrc_ && vrtp_decoder_) {
-                        LOGD("Decoding video RTP packet");
+                        LOGD("[%u]Decoding video RTP packet", current_time);
                         vrtp_decoder_->decode(agent_buf_, agent_ret_);
                     } else {
-                        LOGD("RTP packet SSRC mismatch - dropping packet");
+                        LOGD("[%u]RTP packet SSRC mismatch - dropping packet", current_time);
                     }
                     
                 } else {
                     // Analyze unknown data
-                    LOGD("Unknown data - size: %d, first bytes: %02X %02X",
+                    LOGD("[%u]Unknown data - size: %d, first bytes: %02X %02X",
+                         current_time,
                          agent_ret_, agent_buf_[0], agent_buf_[1]);
                 }
             }
 
-            if (CONFIG_KEEPALIVE_TIMEOUT > 0 && 
-                (current_time - time_of_last_activity_) > CONFIG_KEEPALIVE_TIMEOUT) {
-                LOGI("keepalive timeout");
-                state_changed(PeerConnectionState::CLOSED);
+            if ((CONFIG_KEEPALIVE_TIMEOUT > 0) && (current_time > time_of_last_activity_)) {
+                if ((current_time - time_of_last_activity_) > CONFIG_KEEPALIVE_TIMEOUT) {
+                    LOGI("[%u]keepalive timeout, last activity: %u, diff: %u", 
+                            current_time, time_of_last_activity_, current_time - time_of_last_activity_);
+                    state_changed(PeerConnectionState::CLOSED);
+                }
             }
+        
             break;
         }
             
