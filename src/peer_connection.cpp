@@ -4,10 +4,8 @@
 #include <random>
 #include <chrono>
 
-extern "C" {
 #include "ports.h"
 #include "utils.h"
-}
 #include "sdp.hpp"
 
 namespace rtc {
@@ -59,9 +57,6 @@ PeerConnection::PeerConnection()
     
     // DTLS-SRTP session will be initialized when creating SDP
     
-    memset(temp_buf_, 0, sizeof(temp_buf_));
-    memset(agent_buf_, 0, sizeof(agent_buf_));
-    
     // IceAgent uses RAII - no manual create needed
     agent_.create();
 }
@@ -104,9 +99,6 @@ PeerConnection::PeerConnection(PeerConnection&& other) noexcept
     , on_datachannel_close_(std::move(other.on_datachannel_close_))
 #endif
 {
-    memcpy(temp_buf_, other.temp_buf_, sizeof(temp_buf_));
-    memcpy(agent_buf_, other.agent_buf_, sizeof(agent_buf_));
-    
     // Clear the moved-from object to prevent double cleanup
     other.cleanup();
     // agent_ is moved, no need to clear
@@ -145,9 +137,6 @@ PeerConnection& PeerConnection::operator=(PeerConnection&& other) noexcept {
         on_datachannel_open_ = std::move(other.on_datachannel_open_);
         on_datachannel_close_ = std::move(other.on_datachannel_close_);
 #endif
-        
-        memcpy(temp_buf_, other.temp_buf_, sizeof(temp_buf_));
-        memcpy(agent_buf_, other.agent_buf_, sizeof(agent_buf_));
         
         // Clear the moved-from object to prevent double cleanup
         other.cleanup();
@@ -254,184 +243,199 @@ void PeerConnection::state_changed(PeerConnectionState new_state) {
     }
 }
 
-int PeerConnection::loop() {
+int PeerConnection::Run() {
     uint32_t ssrc = 0;
-    memset(agent_buf_, 0, sizeof(agent_buf_));
-    agent_ret_ = -1;
-    uint32_t current_time = ports_get_epoch_time();
-    
-    switch (state_) {
-        case PeerConnectionState::NEW:
-            break;
-            
-        case PeerConnectionState::CHECKING:
-            if (agent_.select_candidate_pair() < 0) {
-                state_changed(PeerConnectionState::FAILED);
-            } else if (agent_.connectivity_check() == 0) {
-                state_changed(PeerConnectionState::CONNECTED);
-            }
-            break;
-            
-        case PeerConnectionState::CONNECTED: {
-            // Only attempt DTLS handshake if it hasn't completed yet
-            if (dtls_srtp_.get_state() != rtc::DtlsSrtpState::CONNECTED) {
-                Address* remote_addr = agent_.get_nominated_remote_addr();
-                if (remote_addr) {
-                    LOGI("DTLS handshake with remote addr (port: %d)", remote_addr->port);
-                } else {
-                    LOGI("DTLS handshake with null remote addr");
-                }
-                
-                // Limit handshake attempts to prevent infinite loops
-                if (dtls_handshake_delay_counter_ < 10) {  // Further reduced attempts
-                    int handshake_result = dtls_srtp_.handshake(remote_addr);
-                    dtls_handshake_delay_counter_++;
-                    
-                    if (handshake_result == 0) {
-                        LOGI("DTLS-SRTP handshake done after %d attempts", dtls_handshake_delay_counter_);
-                        
-#if CONFIG_ENABLE_DATACHANNEL
-                        if (config_.datachannel != DataChannelType::NONE) {
-                            LOGI("SCTP create socket");
-                            sctp_ = std::make_unique<rtc::SctpAssociation>();
-                            sctp_->create_association(&dtls_srtp_);
-                        }
-#endif
-                        state_changed(PeerConnectionState::COMPLETED);
-                    } else if (handshake_result == -0x7280 || handshake_result == -0x7700) {
-                        // MBEDTLS_ERR_SSL_WANT_READ or similar - check if peer completed
-                        // Give up early if peer already finished and we keep failing
-                        LOGD("DTLS handshake error %x, giving up early", static_cast<unsigned int>(-handshake_result));
-                        dtls_handshake_delay_counter_ = 100; // Force completion check
-                    } else {
-                        // Other errors - small delay and continue
-                        ports_sleep_ms(10);
-                    }
-                } else {
-                    LOGI("DTLS handshake attempts exceeded, checking if DTLS completed anyway");
-                    // Sometimes DTLS completes but handshake returns error
-                    // Check if SRTP sessions were created (indicating successful completion)
-                    if (dtls_srtp_.get_state() == rtc::DtlsSrtpState::CONNECTED) {
-                        LOGI("DTLS state shows connected, proceeding to COMPLETED");
-#if CONFIG_ENABLE_DATACHANNEL
-                        if (config_.datachannel != DataChannelType::NONE && !sctp_) {
-                            LOGI("SCTP create socket");
-                            sctp_ = std::make_unique<rtc::SctpAssociation>();
-                            sctp_->create_association(&dtls_srtp_);
-                        }
-#endif
-                        state_changed(PeerConnectionState::COMPLETED);
-                    } else {
-                        // Accept asymmetric DTLS completion - one peer may complete while other fails
-                        LOGI("DTLS handshake failed but accepting asymmetric completion");
-#if CONFIG_ENABLE_DATACHANNEL
-                        if (config_.datachannel != DataChannelType::NONE && !sctp_) {
-                            LOGI("SCTP create socket despite DTLS failure");
-                            sctp_ = std::make_unique<rtc::SctpAssociation>();
-                            sctp_->create_association(&dtls_srtp_);
-                        }
-#endif
-                        state_changed(PeerConnectionState::COMPLETED);
-                    }
-                }
-            } else {
-                // DTLS already connected, move to COMPLETED state
-                LOGI("DTLS already connected, transitioning to COMPLETED");
-                
-#if CONFIG_ENABLE_DATACHANNEL
-                if (config_.datachannel != DataChannelType::NONE && !sctp_) {
-                    LOGI("SCTP create socket");
-                    sctp_ = std::make_unique<rtc::SctpAssociation>();
-                    sctp_->create_association(&dtls_srtp_);
-                }
-#endif
-                state_changed(PeerConnectionState::COMPLETED);
-            }
-            break;
-        }
-            
-        case PeerConnectionState::COMPLETED: {
-            if (agent_.get_binding_request_time() > time_of_last_activity_) {
-                time_of_last_activity_ = agent_.get_binding_request_time();
-            }
+    uint8_t recv_buf[CONFIG_MTU];
 
-            // Initialize keepalive timer on first entry to COMPLETED state
-            if (next_keepalive_time_ == 0) {
-                next_keepalive_time_ = current_time + 5000; // First keepalive in 5 seconds
-            }
-            
-            // Check if it's time to send keepalive
-            if (current_time >= next_keepalive_time_) {
-                agent_.connectivity_check();
-                
-                // Schedule next keepalive in 5 seconds regardless
-                next_keepalive_time_ = current_time + 5000;
-            }
-            
-            if ((agent_ret_ = agent_.recv(agent_buf_, sizeof(agent_buf_))) > 0) {
-                LOGD("[%u]agent_recv %d", current_time, agent_ret_);
-                // schedule next keepalive in 5 seconds
-                next_keepalive_time_ = current_time + 5000;
-                time_of_last_activity_ = current_time ;
-                
-                if (rtc::RtcpProcessor::probe(agent_buf_, agent_ret_)) {
-                    LOGD("[%u]Got RTCP packet", current_time);
-                    dtls_srtp_.decrypt_rtcp_packet(agent_buf_, &agent_ret_);
-                    incoming_rtcp(agent_buf_, agent_ret_);
-                    
-                } else if (rtc::DtlsSrtpSession::probe(agent_buf_)) {
-                    int ret = dtls_srtp_.read(temp_buf_, sizeof(temp_buf_));
-                    LOGD("[%u]Got DTLS data %d", current_time, ret);
-                   
-#if CONFIG_ENABLE_DATACHANNEL
-                    if (ret > 0 && sctp_) {
-                        sctp_->incoming_data(reinterpret_cast<char*>(temp_buf_), ret);
-                    }
-#endif
-                } else if (rtc::RtpProcessor::validate_packet(agent_buf_, agent_ret_)) {
-                    LOGD("[%u]Got RTP packet, size: %d", current_time, agent_ret_);
-                    
-                    LOGD("[%u]Decrypting RTP packet", current_time);
-                    dtls_srtp_.decrypt_rtp_packet(agent_buf_, &agent_ret_);
-                    LOGD("[%u]RTP packet decrypted, new size: %d", current_time, agent_ret_);
-                    
-                    ssrc = rtc::RtpProcessor::get_ssrc(agent_buf_);
-                    LOGD("Received RTP packet with SSRC: %u, remote_assrc: %u, remote_vssrc: %u", 
-                         ssrc, remote_assrc_, remote_vssrc_);
-                    if (ssrc == remote_assrc_ && artp_decoder_) {
-                        LOGD("[%u]Decoding audio RTP packet", current_time);
-                        artp_decoder_->decode(agent_buf_, agent_ret_);
-                    } else if (ssrc == remote_vssrc_ && vrtp_decoder_) {
-                        LOGD("[%u]Decoding video RTP packet", current_time);
-                        vrtp_decoder_->decode(agent_buf_, agent_ret_);
-                    } else {
-                        LOGD("[%u]RTP packet SSRC mismatch - dropping packet", current_time);
-                    }
-                    
-                } else {
-                    // Analyze unknown data
-                    LOGD("[%u]Unknown data - size: %d, first bytes: %02X %02X",
-                         current_time,
-                         agent_ret_, agent_buf_[0], agent_buf_[1]);
-                }
-            }
-
-            if ((CONFIG_KEEPALIVE_TIMEOUT > 0) && (current_time > time_of_last_activity_)) {
-                if ((current_time - time_of_last_activity_) > CONFIG_KEEPALIVE_TIMEOUT) {
-                    LOGI("[%u]keepalive timeout, last activity: %u, diff: %u", 
-                            current_time, time_of_last_activity_, current_time - time_of_last_activity_);
-                    state_changed(PeerConnectionState::CLOSED);
-                }
-            }
+    for(int retryTries = 5; retryTries > 0; retryTries--) {
+        agent_ret_ = -1;
+        uint32_t current_time = ports_get_epoch_time();
         
-            break;
-        }
+        switch (state_) {
+            case PeerConnectionState::NEW:
+                retryTries = 0;
+                break;
+                
+            case PeerConnectionState::CHECKING:
+                if (agent_.select_candidate_pair() < 0) {
+                    state_changed(PeerConnectionState::FAILED);
+                } else if (agent_.connectivity_check() == 0) {
+                    state_changed(PeerConnectionState::CONNECTED);
+                }
+                ports_sleep_ms(20);
+                break;
+                
+            case PeerConnectionState::CONNECTED: {
+                // Only attempt DTLS handshake if it hasn't completed yet
+                if (dtls_srtp_.get_state() != rtc::DtlsSrtpState::CONNECTED) {
+                    Address* remote_addr = agent_.get_nominated_remote_addr();
+                    if (remote_addr) {
+                        LOGI("DTLS handshake with remote addr (port: %d)", remote_addr->port);
+                    } else {
+                        LOGI("DTLS handshake with null remote addr");
+                    }
+                    
+                    // Limit handshake attempts to prevent infinite loops
+                    if (dtls_handshake_delay_counter_ < 30) {  // Increased attempts for better reliability
+                        int handshake_result = dtls_srtp_.handshake(remote_addr);
+                        dtls_handshake_delay_counter_++;
+                        
+                        if (handshake_result == 0) {
+                            LOGI("DTLS-SRTP handshake done after %d attempts", dtls_handshake_delay_counter_);
+                            
+    #if CONFIG_ENABLE_DATACHANNEL
+                            if (config_.datachannel != DataChannelType::NONE) {
+                                LOGI("SCTP create socket");
+                                sctp_ = std::make_unique<rtc::SctpAssociation>();
+                                sctp_->create_association(&dtls_srtp_);
+                            }
+    #endif
+                            state_changed(PeerConnectionState::COMPLETED);
+                        } else if (handshake_result == -0x7280) {
+                            // MBEDTLS_ERR_SSL_CONN_EOF - connection closed by peer
+                            LOGD("DTLS handshake connection closed by peer (attempt %d/30)", dtls_handshake_delay_counter_);
+                            // Add exponential backoff for retries
+                            if (dtls_handshake_delay_counter_ < 10) {
+                                ports_sleep_ms(20);
+                            } else if (dtls_handshake_delay_counter_ < 20) {
+                                ports_sleep_ms(50);
+                            } else {
+                                ports_sleep_ms(100);
+                            }
+                        } else if (handshake_result == -0x7700) {
+                            // MBEDTLS_ERR_SSL_WANT_READ - normal, continue
+                            ports_sleep_ms(10);
+                        } else {
+                            // Other errors - log and continue with small delay
+                            LOGD("DTLS handshake error -0x%x (attempt %d/30)", static_cast<unsigned int>(-handshake_result), dtls_handshake_delay_counter_);
+                            ports_sleep_ms(20);
+                        }
+                    } else {
+                        LOGI("DTLS handshake attempts exceeded, checking if DTLS completed anyway");
+                        // Sometimes DTLS completes but handshake returns error
+                        // Check if SRTP sessions were created (indicating successful completion)
+                        if (dtls_srtp_.get_state() == rtc::DtlsSrtpState::CONNECTED) {
+                            LOGI("DTLS state shows connected, proceeding to COMPLETED");
+    #if CONFIG_ENABLE_DATACHANNEL
+                            if (config_.datachannel != DataChannelType::NONE && !sctp_) {
+                                LOGI("SCTP create socket");
+                                sctp_ = std::make_unique<rtc::SctpAssociation>();
+                                sctp_->create_association(&dtls_srtp_);
+                            }
+    #endif
+                            state_changed(PeerConnectionState::COMPLETED);
+                        } else {
+                            // DTLS handshake failed completely
+                            LOGE("DTLS handshake failed after %d attempts, moving to FAILED state", dtls_handshake_delay_counter_);
+                            state_changed(PeerConnectionState::FAILED);
+                            // Reset counter for potential reconnection
+                            dtls_handshake_delay_counter_ = 0;
+                        }
+                    }
+                } else {
+                    // DTLS already connected, move to COMPLETED state
+                    LOGI("DTLS already connected, transitioning to COMPLETED");
+                    
+    #if CONFIG_ENABLE_DATACHANNEL
+                    if (config_.datachannel != DataChannelType::NONE && !sctp_) {
+                        LOGI("SCTP create socket");
+                        sctp_ = std::make_unique<rtc::SctpAssociation>();
+                        sctp_->create_association(&dtls_srtp_);
+                    }
+    #endif
+                    state_changed(PeerConnectionState::COMPLETED);
+                }
+                break;
+            }
+                
+            case PeerConnectionState::COMPLETED: {
+                if (agent_.get_binding_request_time() > time_of_last_activity_) {
+                    time_of_last_activity_ = agent_.get_binding_request_time();
+                }
+
+                // Initialize keepalive timer on first entry to COMPLETED state
+                if (next_keepalive_time_ == 0) {
+                    next_keepalive_time_ = current_time + 5000; // First keepalive in 5 seconds
+                }
+                
+                // Check if it's time to send keepalive
+                if (current_time >= next_keepalive_time_) {
+                    agent_.connectivity_check();
+                    
+                    // Schedule next keepalive in 5 seconds regardless
+                    next_keepalive_time_ = current_time + 5000;
+                }
+                
+                if ((agent_ret_ = agent_.recv(recv_buf, sizeof(recv_buf))) > 0) {
+                    LOGD("[%u]agent_recv %d", current_time, agent_ret_);
+                    // schedule next keepalive in 5 seconds
+                    next_keepalive_time_ = current_time + 5000;
+                    time_of_last_activity_ = current_time ;
+                    
+                    if (rtc::RtcpProcessor::probe(recv_buf, agent_ret_)) {
+                        LOGD("[%u]Got RTCP packet", current_time);
+                        dtls_srtp_.decrypt_rtcp_packet(recv_buf, &agent_ret_);
+                        incoming_rtcp(recv_buf, agent_ret_);
+                        
+                    } else if (rtc::DtlsSrtpSession::probe(recv_buf)) {
+                        // Reuse recv_buf for DTLS decrypted data
+                        int ret = dtls_srtp_.read(recv_buf, sizeof(recv_buf));
+                        LOGD("[%u]Got DTLS data %d", current_time, ret);
+                    
+    #if CONFIG_ENABLE_DATACHANNEL
+                        if (ret > 0 && sctp_) {
+                            sctp_->incoming_data(reinterpret_cast<char*>(recv_buf), ret);
+                        }
+    #endif
+                    } else if (rtc::RtpProcessor::validate_packet(recv_buf, agent_ret_)) {
+                        LOGD("[%u]Got RTP packet, size: %d", current_time, agent_ret_);
+                        
+                        LOGD("[%u]Decrypting RTP packet", current_time);
+                        dtls_srtp_.decrypt_rtp_packet(recv_buf, &agent_ret_);
+                        LOGD("[%u]RTP packet decrypted, new size: %d", current_time, agent_ret_);
+                        
+                        ssrc = rtc::RtpProcessor::get_ssrc(recv_buf);
+                        LOGD("Received RTP packet with SSRC: %u, remote_assrc: %u, remote_vssrc: %u", 
+                            ssrc, remote_assrc_, remote_vssrc_);
+                        if (ssrc == remote_assrc_ && artp_decoder_) {
+                            LOGD("[%u]Decoding audio RTP packet", current_time);
+                            artp_decoder_->decode(recv_buf, agent_ret_);
+                        } else if (ssrc == remote_vssrc_ && vrtp_decoder_) {
+                            LOGD("[%u]Decoding video RTP packet", current_time);
+                            vrtp_decoder_->decode(recv_buf, agent_ret_);
+                        } else {
+                            LOGD("[%u]RTP packet SSRC mismatch - dropping packet", current_time);
+                        }
+                        
+                    } else {
+                        // Analyze unknown data
+                        LOGD("[%u]Unknown data - size: %d, first bytes: %02X %02X",
+                            current_time,
+                            agent_ret_, recv_buf[0], recv_buf[1]);
+                    }
+                } else {
+                    // 缓冲区中没有数据，等待下一次循环
+                    retryTries = 0;
+                }
+
+                if ((CONFIG_KEEPALIVE_TIMEOUT > 0) && (current_time > time_of_last_activity_)) {
+                    if ((current_time - time_of_last_activity_) > CONFIG_KEEPALIVE_TIMEOUT) {
+                        LOGI("[%lu]keepalive timeout, last activity: %lu, diff: %lu", 
+                                (unsigned long)current_time, (unsigned long)time_of_last_activity_, (unsigned long)(current_time - time_of_last_activity_));
+                        state_changed(PeerConnectionState::CLOSED);
+                    }
+                }
             
-        case PeerConnectionState::FAILED:
-        case PeerConnectionState::DISCONNECTED:
-        case PeerConnectionState::CLOSED:
-        default:
-            break;
+                break;
+            }
+                
+            case PeerConnectionState::FAILED:
+            case PeerConnectionState::DISCONNECTED:
+            case PeerConnectionState::CLOSED:
+            default:
+                retryTries = 0;
+                break;
+        }
     }
     
     return 0;
@@ -653,10 +657,6 @@ void PeerConnection::set_remote_description(const std::string& sdp, SdpType type
 }
 
 std::string PeerConnection::create_sdp(SdpType sdp_type) {
-    char description[AGENT_MAX_DESCRIPTION];
-    memset(description, 0, sizeof(description));
-    memset(temp_buf_, 0, sizeof(temp_buf_));
-    
     rtc::DtlsSrtpRole role = rtc::DtlsSrtpRole::SERVER;
     
 #if CONFIG_ENABLE_DATACHANNEL

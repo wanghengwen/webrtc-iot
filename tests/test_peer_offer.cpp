@@ -48,7 +48,7 @@ void* peer_connection_task(void* user_data) {
     auto* pc = static_cast<rtc::PeerConnection*>(user_data);
 
     while (!test_complete) {
-        pc->loop();
+        pc->Run();
         usleep(1000);
     }
 

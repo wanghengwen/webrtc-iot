@@ -8,14 +8,12 @@
 #include <iostream>
 #include <sstream>
 
-extern "C" {
 #include "config.h"
 #include "base64.h"
 #include "ports.h"
 #include "socket.h"
 #include "stun.h"
 #include "utils.h"
-}
 
 namespace rtc {
 
@@ -186,7 +184,7 @@ int IceAgent::create_stun_addr(const Address* serv_addr) {
     std::memset(&send_msg, 0, sizeof(send_msg));
     std::memset(&recv_msg, 0, sizeof(recv_msg));
 
-    stun_msg_create(&send_msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+    stun_msg_create(&send_msg, static_cast<uint16_t>(static_cast<uint16_t>(STUN_CLASS_REQUEST) | static_cast<uint16_t>(STUN_METHOD_BINDING)));
 
     ret = socket_send(serv_addr, send_msg.buf, send_msg.size);
 
@@ -365,7 +363,7 @@ void IceAgent::create_binding_response(StunMessage* msg, const Address* addr) {
     uint8_t mask[16];
     StunHeader* header;
     
-    stun_msg_create(msg, STUN_CLASS_RESPONSE | STUN_METHOD_BINDING);
+    stun_msg_create(msg, static_cast<uint16_t>(static_cast<uint16_t>(STUN_CLASS_RESPONSE) | static_cast<uint16_t>(STUN_METHOD_BINDING)));
     header = (StunHeader*)msg->buf;
     std::memcpy(header->transaction_id, transaction_id_.data(), sizeof(header->transaction_id));
     
@@ -382,7 +380,7 @@ void IceAgent::create_binding_response(StunMessage* msg, const Address* addr) {
 void IceAgent::create_binding_request(StunMessage* msg) {
     uint64_t tie_breaker = 0;  // always be controlled
     
-    stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+    stun_msg_create(msg, static_cast<uint16_t>(static_cast<uint16_t>(STUN_CLASS_REQUEST) | static_cast<uint16_t>(STUN_METHOD_BINDING)));
     char username[584];
     std::memset(username, 0, sizeof(username));
     std::snprintf(username, sizeof(username), "%s:%s", remote_ufrag_.c_str(), local_ufrag_.c_str());

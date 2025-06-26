@@ -8,9 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-extern "C" {
 #include "config.h"
-}
 #include "agent.hpp"
 #include "dtls_srtp.hpp"
 #include "rtp.hpp"
@@ -91,7 +89,7 @@ public:
     const std::string& state_to_string() const;
     
     // Main processing loop
-    int loop();
+    int Run();
     
 #if CONFIG_ENABLE_DATACHANNEL
     int create_datachannel(DecpChannelType channel_type, uint16_t priority, 
@@ -155,8 +153,6 @@ private:
 
     std::string sdp_;
     
-    uint8_t temp_buf_[CONFIG_MTU];
-    uint8_t agent_buf_[CONFIG_MTU];
     int agent_ret_;
     bool local_description_created_;
     int dtls_handshake_delay_counter_;

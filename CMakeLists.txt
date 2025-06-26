@@ -3,14 +3,43 @@ cmake_minimum_required(VERSION 3.1)
 # Removed coreHTTP and coreMQTT dependencies - signaling handled by user application
 
 if (DEFINED ENV{IDF_PATH})
-  file(GLOB ESP32_CODES "./src/*.c")
+  # Include both C and C++ source files for ESP-IDF build
+  file(GLOB ESP32_C_CODES "./src/*.c")
+  file(GLOB ESP32_CXX_CODES "./src/*.cpp")
+  set(ESP32_CODES ${ESP32_C_CODES} ${ESP32_CXX_CODES})
+  
+  # Remove sctp.cpp from sources since we're disabling DATACHANNEL
+  list(REMOVE_ITEM ESP32_CXX_CODES "./src/sctp.cpp")
+  set(ESP32_CODES ${ESP32_C_CODES} ${ESP32_CXX_CODES})
+  
   idf_component_register(
    SRCS ${ESP32_CODES}
    INCLUDE_DIRS "./include"
    PRIV_INCLUDE_DIRS "./src" 
-   REQUIRES mbedtls srtp json esp_netif
+   REQUIRES mbedtls esp_netif nvs_flash
+   PRIV_REQUIRES libsrtp
   )
-  add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN")
+  
+  # Set C++ standard for ESP-IDF
+  target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)
+  
+  # ESP32-specific compile definitions
+  target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    CONFIG_USE_LWIP=1
+    CONFIG_ENABLE_DATACHANNEL=0
+    CONFIG_AUDIO_BUFFER_SIZE=2048
+    CONFIG_DATA_BUFFER_SIZE=4096
+    __BYTE_ORDER=__LITTLE_ENDIAN
+  )
+  
+  # ESP32-specific compile options
+  target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-format-truncation
+    -Wno-format
+  )
+  
   return()
 endif()
 

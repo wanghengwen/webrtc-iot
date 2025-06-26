@@ -2,9 +2,8 @@
 #include <cstring>
 #include <arpa/inet.h>
 
-extern "C" {
 #include "address.h"
-}
+
 
 namespace rtc {
 
@@ -120,12 +119,12 @@ std::unique_ptr<RtcpPacket> RtcpProcessor::parse(const uint8_t* packet, size_t s
             if (header->rc == 1 && size >= 12) {
                 auto pli = std::make_unique<RtcpPli>();
                 if (pli->parse(packet, size)) {
-                    return std::move(pli);
+                    return pli;
                 }
             } else if (header->rc == 4 && size >= 20) {
                 auto fir = std::make_unique<RtcpFirPacket>();
                 if (fir->parse(packet, size)) {
-                    return std::move(fir);
+                    return fir;
                 }
             }
             break;
@@ -133,7 +132,7 @@ std::unique_ptr<RtcpPacket> RtcpProcessor::parse(const uint8_t* packet, size_t s
         case RtcpType::RR: {
             auto rr = std::make_unique<RtcpReceiverReport>();
             if (rr->parse(packet, size)) {
-                return std::move(rr);
+                return rr;
             }
             break;
         }
