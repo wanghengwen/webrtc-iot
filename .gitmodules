@@ -1,9 +1,12 @@
 [submodule "third_party/libsrtp"]
 	path = third_party/libsrtp
 	url = https://github.com/cisco/libsrtp.git
+	branch = v2.6.0
 [submodule "third_party/usrsctp"]
 	path = third_party/usrsctp
 	url = https://github.com/sctplab/usrsctp.git
+	branch = 881513ab3fc75b4c53ffce7b22b08e7b07fcc67a
 [submodule "third_party/mbedtls"]
 	path = third_party/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
+	branch = v3.4.1

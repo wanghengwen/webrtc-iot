@@ -4,9 +4,7 @@
 #include <iostream>
 #include <arpa/inet.h>
 
-extern "C" {
 #include "utils.h"
-}
 
 namespace rtc {
 

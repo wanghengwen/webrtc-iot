@@ -3,13 +3,11 @@
 #include <cstring>
 #include <cinttypes>
 
-extern "C" {
 #include "address.h"
 #include "mdns.h"
 #include "ports.h"
 #include "socket.h"
 #include "utils.h"
-}
 
 namespace rtc {
 

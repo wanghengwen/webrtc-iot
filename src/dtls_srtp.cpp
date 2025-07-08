@@ -3,13 +3,11 @@
 #include <cstring>
 #include <memory>
 
-extern "C" {
 #include "config.h"
 #include "ports.h"
 #include "socket.h"
 #include "utils.h"
 #include <srtp2/srtp.h>
-}
 
 #if CONFIG_MBEDTLS_DEBUG
 #include "mbedtls/debug.h"

@@ -2,10 +2,8 @@
 #include <cstring>
 #include <arpa/inet.h>
 
-extern "C" {
 #include "address.h"
 #include "utils.h"
-}
 
 namespace rtc {
 
