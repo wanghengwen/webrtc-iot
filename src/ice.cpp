@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
-
 #include "address.h"
 #include "mdns.h"
 #include "ports.h"

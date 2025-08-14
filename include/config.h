@@ -3,6 +3,7 @@
 
 // uncomment this if you want to handshake with a aiortc
 // #define CONFIG_DTLS_USE_ECDSA 1
+#define CONFIG_USE_USRSCTP 0
 
 #define SCTP_MTU (1200)
 #define CONFIG_MTU (1300)
@@ -65,7 +66,7 @@
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
 
-// #define LOG_LEVEL LEVEL_DEBUG
+//#define LOG_LEVEL LEVEL_DEBUG
 #define LOG_REDIRECT 0
 
 

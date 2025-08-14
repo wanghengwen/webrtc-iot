@@ -16,13 +16,15 @@
 #include <mbedtls/timing.h>
 #include <mbedtls/x509_crt.h>
 
-extern "C" {
 #include "config.h"
 #include "address.h"
 #if CONFIG_ENABLE_RTP_ENCRYPTION
+#if ESP_PLATFORM
+#include <srtp.h>
+#else
 #include <srtp2/srtp.h>
 #endif
-}
+#endif
 
 namespace rtc {
 

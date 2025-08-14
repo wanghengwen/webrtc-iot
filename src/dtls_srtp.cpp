@@ -7,7 +7,7 @@
 #include "ports.h"
 #include "socket.h"
 #include "utils.h"
-#include <srtp2/srtp.h>
+
 
 #if CONFIG_MBEDTLS_DEBUG
 #include "mbedtls/debug.h"
@@ -94,18 +94,15 @@ void DtlsSrtpSession::deinit() {
 
 int DtlsSrtpSession::udp_send_wrapper(void* ctx, const uint8_t* buf, size_t len) {
     DtlsSrtpSession* session = static_cast<DtlsSrtpSession*>(ctx);
+    
     if (session->udp_send_) {
-        int ret = session->udp_send_(buf, len);
-        LOGI("DTLS UDP send via callback: %d bytes, result: %d", static_cast<int>(len), ret);
-        return ret;
+        return session->udp_send_(buf, len);
     }
     
     // Fallback to default UDP socket send
     UdpSocket* udp_socket = static_cast<UdpSocket*>(session->user_data_);
     if (udp_socket && session->remote_addr_) {
-        int ret = udp_socket_sendto(udp_socket, session->remote_addr_, buf, len);
-        LOGI("DTLS UDP send via socket: %d bytes, result: %d", static_cast<int>(len), ret);
-        return ret;
+        return udp_socket_sendto(udp_socket, session->remote_addr_, buf, len);
     }
     
     LOGE("DTLS UDP send failed: no callback or socket available");
@@ -123,19 +120,16 @@ int DtlsSrtpSession::udp_recv_wrapper(void* ctx, uint8_t* buf, size_t len) {
         do {
             ret = session->udp_recv_(buf, len);
             if (ret > 0) {
-                LOGI("DTLS UDP recv via callback: %d bytes (attempt %d)", ret, attempts + 1);
                 return ret;
             } else if (ret == 0) {
                 // Timeout - wait a bit and retry like original C version
                 ports_sleep_ms(1);
                 attempts++;
             } else {
-                LOGD("DTLS UDP recv via callback: error %d", ret);
                 return ret;
             }
         } while (attempts < max_attempts);
         
-        LOGD("DTLS UDP recv timeout after %d attempts", attempts);
         return ret;
     }
     
@@ -146,7 +140,6 @@ int DtlsSrtpSession::udp_recv_wrapper(void* ctx, uint8_t* buf, size_t len) {
         while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
             ports_sleep_ms(1);
         }
-        LOGI("DTLS UDP recv via socket: %d bytes", ret);
         return ret;
     }
     
@@ -547,7 +540,6 @@ int DtlsSrtpSession::handshake_server() {
         attempts++;
         
         if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-            LOGD("DTLS hello verification requested");
         } else if (ret != 0) {
             LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x (attempt %d/%d)", static_cast<unsigned int>(-ret), attempts, max_attempts);
             if (attempts >= max_attempts) {
@@ -558,7 +550,6 @@ int DtlsSrtpSession::handshake_server() {
         }
     }
     
-    LOGD("DTLS server handshake done (attempts: %d)", attempts);
     return ret;
 }
 
@@ -568,7 +559,6 @@ int DtlsSrtpSession::handshake_client() {
         LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", static_cast<unsigned int>(-ret));
     }
     
-    LOGD("DTLS client handshake done");
     return ret;
 }
 

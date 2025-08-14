@@ -10,21 +10,15 @@
 #include <memory>
 #include <array>
 
-extern "C" {
 #include "base64.h"
 #include "socket.h"
 #include "stun.h"
-#include "utils.h"
 #include "ports.h"
-}
 
 #include "ice.hpp"
 
 namespace rtc {
 
-#ifndef AGENT_MAX_DESCRIPTION
-#define AGENT_MAX_DESCRIPTION 40960
-#endif
 
 #ifndef AGENT_MAX_CANDIDATES
 #define AGENT_MAX_CANDIDATES 10

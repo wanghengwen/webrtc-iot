@@ -1,7 +1,14 @@
 dependencies:
-  sepfy/srtp: ^2.0.4
-  sepfy/usrsctp: ^0.9.5
-description: libpeer
+  idf: ">=5.0"
+description: WebRTC IoT component for ESP32 - Real-time communication library
 license: MIT
-url: https://github.com/sepfy/libpeer
-version: 0.0.3
+url: https://github.com/wanghengwen/webrtc-iot
+version: 0.0.1
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c2
+  - esp32c6
+  - esp32h2

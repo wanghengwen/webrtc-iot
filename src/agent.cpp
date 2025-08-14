@@ -1,3 +1,19 @@
+/* 
+ * NAT Traversal Solution:
+ * 
+ * This implementation handles the case where the server is behind NAT (e.g., WSL with NAT mode).
+ * When the server has internal IPs (172.x) in its SDP but actually communicates from a NAT IP
+ * (e.g., 192.168.3.148), we create peer-reflexive candidates dynamically.
+ * 
+ * Key behaviors:
+ * 1. When receiving BINDING request from unknown address -> create peer-reflexive candidate
+ * 2. As CONTROLLED role -> immediately nominate peer-reflexive pairs for NAT scenarios  
+ * 3. Prioritize SUCCEEDED pairs over INPROGRESS ones for nomination
+ * 4. For NAT scenarios, the first successful connection path is used immediately
+ * 
+ * This ensures connectivity even when one peer is behind NAT without public IP.
+ */
+
 #include "agent.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +58,12 @@ void IceAgent::clear_candidates() {
     local_candidates_.clear();
     remote_candidates_.clear();
     candidate_pairs_.clear();
+    
+    // 预先分配空间以避免后续添加时重新分配
+    local_candidates_.reserve(10);
+    remote_candidates_.reserve(20);  // 包括原始候选和 peer-reflexive
+    candidate_pairs_.reserve(32);
+    
     selected_pair_ = nullptr;
     nominated_pair_ = nullptr;
 }
@@ -91,6 +113,8 @@ int IceAgent::socket_recv(Address* addr, uint8_t* buf, int len) {
     int maxfd = -1;
     fd_set rfds;
     struct timeval tv;
+    static uint32_t timeout_count = 0;
+    static uint32_t select_error_count = 0;
     int addr_type[] = { AF_INET,
 #if CONFIG_IPV6
                         AF_INET6,
@@ -112,14 +136,22 @@ int IceAgent::socket_recv(Address* addr, uint8_t* buf, int len) {
 
     ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
     if (ret < 0) {
-        LOGE("select error");
+        select_error_count++;
+        LOGE("select error #%lu: %s", (unsigned long)select_error_count, strerror(errno));
     } else if (ret == 0) {
-        // timeout
+        // timeout - 这是正常的，不需要每次都记录
+        timeout_count++;
+        if (timeout_count % 1000 == 0) {
+            LOGD("socket_recv timeout count: %lu", (unsigned long)timeout_count);
+        }
     } else {
+        // 有数据可读
         for (int i = 0; i < 2; i++) {
-            if (FD_ISSET(udp_sockets_[i].fd, &rfds)) {
+            if (udp_sockets_[i].fd >= 0 && FD_ISSET(udp_sockets_[i].fd, &rfds)) {
                 std::memset(buf, 0, len);
                 ret = udp_socket_recvfrom(&udp_sockets_[i], addr, buf, len);
+                
+                // 移除调试日志
                 break;
             }
         }
@@ -129,14 +161,19 @@ int IceAgent::socket_recv(Address* addr, uint8_t* buf, int len) {
 }
 
 int IceAgent::socket_send(const Address* addr, const uint8_t* buf, int len) {
+    int ret = -1;
+    
     switch (addr->family) {
         case AF_INET6:
-            return udp_socket_sendto(&udp_sockets_[1], const_cast<Address*>(addr), buf, len);
+            ret = udp_socket_sendto(&udp_sockets_[1], const_cast<Address*>(addr), buf, len);
+            break;
         case AF_INET:
         default:
-            return udp_socket_sendto(&udp_sockets_[0], const_cast<Address*>(addr), buf, len);
+            ret = udp_socket_sendto(&udp_sockets_[0], const_cast<Address*>(addr), buf, len);
+            break;
     }
-    return -1;
+    
+    return ret;
 }
 
 int IceAgent::socket_recv_attempts(Address* addr, uint8_t* buf, int len, int maxtimes) {
@@ -179,10 +216,12 @@ int IceAgent::create_host_addr() {
 int IceAgent::create_stun_addr(const Address* serv_addr) {
     int ret = -1;
     Address bind_addr;
+    Address recv_addr;  // 添加接收地址变量
     StunMessage send_msg;
     StunMessage recv_msg;
     std::memset(&send_msg, 0, sizeof(send_msg));
     std::memset(&recv_msg, 0, sizeof(recv_msg));
+    std::memset(&recv_addr, 0, sizeof(recv_addr));  // 初始化接收地址
 
     stun_msg_create(&send_msg, static_cast<uint16_t>(static_cast<uint16_t>(STUN_CLASS_REQUEST) | static_cast<uint16_t>(STUN_METHOD_BINDING)));
 
@@ -193,7 +232,8 @@ int IceAgent::create_stun_addr(const Address* serv_addr) {
         return ret;
     }
 
-    ret = socket_recv_attempts(nullptr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
+    // 传入有效的地址指针而不是 nullptr
+    ret = socket_recv_attempts(&recv_addr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
     if (ret <= 0) {
         LOGD("Failed to receive STUN Binding Response.");
         return ret;
@@ -213,11 +253,13 @@ int IceAgent::create_turn_addr(const Address* serv_addr, const std::string& user
     int ret = -1;
     uint32_t attr = ntohl(0x11000000);
     Address turn_addr;
+    Address recv_addr;  // 添加接收地址变量
     StunMessage send_msg;
     StunMessage recv_msg;
     
     std::memset(&recv_msg, 0, sizeof(recv_msg));
     std::memset(&send_msg, 0, sizeof(send_msg));
+    std::memset(&recv_addr, 0, sizeof(recv_addr));  // 初始化接收地址
     
     stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
     stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
@@ -229,7 +271,8 @@ int IceAgent::create_turn_addr(const Address* serv_addr, const std::string& user
         return -1;
     }
 
-    ret = socket_recv_attempts(nullptr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
+    // 传入有效的地址指针而不是 nullptr
+    ret = socket_recv_attempts(&recv_addr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
     if (ret <= 0) {
         LOGD("Failed to receive TURN Binding Response.");
         return ret;
@@ -256,7 +299,8 @@ int IceAgent::create_turn_addr(const Address* serv_addr, const std::string& user
         return -1;
     }
 
-    ret = socket_recv_attempts(nullptr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
+    // 传入有效的地址指针而不是 nullptr
+    ret = socket_recv_attempts(&recv_addr, recv_msg.buf, sizeof(recv_msg.buf), STUN_RECV_MAXTIMES);
     if (ret <= 0) {
         LOGD("Failed to receive TURN Binding Response.");
         return ret;
@@ -343,12 +387,18 @@ void IceAgent::get_local_description(std::string& description) const {
         description.pop_back();
     }
     
-    LOGD("local description:\n%s", description.c_str());
 }
 
 int IceAgent::send(const uint8_t* buf, int len) {
     if (nominated_pair_ == nullptr) {
         LOGE("No nominated pair available for sending");
+        return -1;
+    }
+    
+    // 确保 nominated pair 是成功状态
+    if (nominated_pair_->get_state() != IceCandidateState::SUCCEEDED) {
+        LOGW("Nominated pair not in SUCCEEDED state (current: %d)",
+             static_cast<int>(nominated_pair_->get_state()));
         return -1;
     }
     
@@ -400,21 +450,263 @@ void IceAgent::create_binding_request(StunMessage* msg) {
     stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, const_cast<char*>(remote_upwd_.c_str()), remote_upwd_.length());
 }
 
+// Helper function to check if USE_CANDIDATE attribute is present
+static bool has_use_candidate_attr(uint8_t* buf, size_t len) {
+    StunHeader* header = (StunHeader*)buf;
+    size_t offset = sizeof(StunHeader);
+    
+    while (offset < len) {
+        if (offset + sizeof(StunAttribute) > len) break;
+        
+        StunAttribute* attr = (StunAttribute*)(buf + offset);
+        uint16_t type = ntohs(attr->type);
+        uint16_t attr_len = ntohs(attr->length);
+        
+        if (type == STUN_ATTR_TYPE_USE_CANDIDATE) {
+            return true;
+        }
+        
+        // Move to next attribute (4-byte aligned)
+        offset += sizeof(StunAttribute) + ((attr_len + 3) & ~3);
+    }
+    return false;
+}
+
 void IceAgent::process_stun_request(StunMessage* stun_msg, const Address* addr) {
     StunMessage msg;
     StunHeader* header;
+    char addr_str[ADDRSTRLEN];
+    
+    addr_to_string(addr, addr_str, sizeof(addr_str));
     
     switch (stun_msg->stunmethod) {
         case STUN_METHOD_BINDING:
+            
             if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, const_cast<char*>(local_upwd_.c_str())) == 0) {
                 header = (StunHeader*)stun_msg->buf;
                 std::memcpy(transaction_id_.data(), header->transaction_id, sizeof(header->transaction_id));
+                
+                // 创建并发送响应
                 create_binding_response(&msg, addr);
-                socket_send(addr, msg.buf, msg.size);
+                int ret = socket_send(addr, msg.buf, msg.size);
+                
+                if (ret > 0) {
+                    
+                    // 对于NAT场景，立即发送一个 BINDING REQUEST 回去
+                    // 这有助于保持NAT映射并验证双向连通性
+                    static uint32_t nat_keepalive_counter = 0;
+                    nat_keepalive_counter++;
+                    
+                    // 每5个响应发送一个请求（避免太频繁）
+                    if (nat_keepalive_counter % 5 == 1) {
+                        StunMessage keepalive_msg;
+                        create_binding_request(&keepalive_msg);
+                        socket_send(addr, keepalive_msg.buf, keepalive_msg.size);
+                    }
+                    
+                    // 更新或创建候选对
+                    bool pair_found = false;
+                    
+                    // 先检查远程候选列表，看是否已经有这个地址
+                    bool remote_candidate_exists = false;
+                    for (size_t idx = 0; idx < remote_candidates_.size(); idx++) {
+                        Address remote_addr = remote_candidates_[idx].get_addr();
+                        if (addr_equal(&remote_addr, const_cast<Address*>(addr))) {
+                            remote_candidate_exists = true;
+                            LOGD("Remote candidate already exists at index %zu for %s:%d", idx, addr_str, addr->port);
+                            break;
+                        }
+                    }
+                    
+                    // 输出当前的提名状态以便调试
+                    if (nominated_pair_) {
+                        Address nom_addr = nominated_pair_->get_remote()->get_addr();
+                        char nom_str[ADDRSTRLEN];
+                        addr_to_string(&nom_addr, nom_str, sizeof(nom_str));
+                        LOGD("Current nominated pair: remote=%s:%d, state=%d", 
+                             nom_str, nom_addr.port, static_cast<int>(nominated_pair_->get_state()));
+                    } else {
+                        LOGD("No nominated pair currently set");
+                    }
+                    
+                    // 检查候选对列表
+                    for (size_t idx = 0; idx < candidate_pairs_.size(); idx++) {
+                        Address remote_addr = candidate_pairs_[idx].get_remote()->get_addr();
+                        
+                        if (addr_equal(&remote_addr, const_cast<Address*>(addr))) {
+                            // 找到匹配的候选对，更新状态
+                            if (candidate_pairs_[idx].get_state() != IceCandidateState::SUCCEEDED) {
+                                candidate_pairs_[idx].set_state(IceCandidateState::SUCCEEDED);
+                                LOGI("Candidate pair[%zu] with %s:%d marked as SUCCEEDED", idx, addr_str, addr->port);
+                            } else {
+                                LOGD("Candidate pair[%zu] with %s:%d already in SUCCEEDED state", idx, addr_str, addr->port);
+                            }
+                            
+                            // 更新远程候选的地址（可能端口已变化）
+                            // 这对NAT场景很重要，因为端口可能会变化
+                            candidate_pairs_[idx].get_remote()->set_addr(*addr);
+                            LOGD("Updated pair[%zu] remote address to %s:%d (latest received from)", 
+                                 idx, addr_str, addr->port);
+                            
+                            // 检查是否需要提名该候选对
+                            bool should_update_nomination = false;
+                            
+                            if (mode_ == AgentMode::CONTROLLED) {
+                                // CONTROLLED 角色: 优先检查 USE-CANDIDATE
+                                bool has_use_candidate = has_use_candidate_attr(stun_msg->buf, stun_msg->size);
+                                
+                                if (has_use_candidate) {
+                                    // USE-CANDIDATE 表示 CONTROLLING 方要求使用这个候选对
+                                    should_update_nomination = true;
+                                    LOGI("[ICE-CONTROLLED] USE-CANDIDATE received for pair[%zu], must nominate", idx);
+                                } else if (!nominated_pair_) {
+                                    // 没有提名的候选对，使用第一个成功的
+                                    should_update_nomination = true;
+                                    LOGI("[ICE-CONTROLLED] No nominated pair yet, using first successful pair[%zu]", idx);
+                                } else if (nominated_pair_->get_state() != IceCandidateState::SUCCEEDED) {
+                                    // 当前提名的候选对不是成功状态，切换到成功的
+                                    should_update_nomination = true;
+                                    LOGI("[ICE-CONTROLLED] Current nominated pair not succeeded, switching to pair[%zu]", idx);
+                                }
+                            } else {
+                                // CONTROLLING 角色: 主动提名
+                                if (!nominated_pair_ || nominated_pair_->get_state() != IceCandidateState::SUCCEEDED) {
+                                    should_update_nomination = true;
+                                    LOGI("[ICE-CONTROLLING] Nominating successful pair[%zu]", idx);
+                                }
+                            }
+                            
+                            if (should_update_nomination) {
+                                nominated_pair_ = &candidate_pairs_[idx];
+                                LOGI("*** NOMINATED pair[%zu] for %s:%d (mode=%s) ***", 
+                                     idx, addr_str, addr->port, 
+                                     mode_ == AgentMode::CONTROLLED ? "CONTROLLED" : "CONTROLLING");
+                            }
+                            pair_found = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!pair_found && !remote_candidate_exists) {
+                        // 来自未知地址的请求 - 根据 ICE 规范，这是 peer-reflexive candidate
+                        // 当我们是 Controlled 角色时，收到 Controlling 方的 Binding Request 表示对方选择了这条路径
+                        LOGI("BINDING request from new address %s:%d, creating peer-reflexive candidate", 
+                             addr_str, addr->port);
+                        
+                        // 创建 peer-reflexive candidate
+                        IceCandidate peer_reflexive_candidate;
+                        peer_reflexive_candidate.create(remote_candidates_.size(), IceCandidateType::PRFLX, *addr);
+                        
+                        // 添加到远程候选列表
+                        remote_candidates_.push_back(peer_reflexive_candidate);
+                        LOGI("Added peer-reflexive candidate: %s:%d", addr_str, addr->port);
+                        
+                        // 为新的候选创建候选对
+                        for (size_t i = 0; i < local_candidates_.size(); i++) {
+                            if (local_candidates_[i].get_addr().family == addr->family) {
+                                auto local_ptr = std::make_shared<IceCandidate>(local_candidates_[i]);
+                                auto remote_ptr = std::make_shared<IceCandidate>(peer_reflexive_candidate);
+                                
+                                IceCandidatePair new_pair(local_ptr, remote_ptr);
+                                new_pair.set_state(IceCandidateState::SUCCEEDED);  // 已收到请求，连接验证成功
+                                
+                                // 保存当前nominated pair的索引（如果有）
+                                int nominated_idx = -1;
+                                if (nominated_pair_) {
+                                    for (size_t j = 0; j < candidate_pairs_.size(); j++) {
+                                        if (&candidate_pairs_[j] == nominated_pair_) {
+                                            nominated_idx = j;
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                // 添加新的候选对
+                                candidate_pairs_.push_back(new_pair);
+                                
+                                // 重新设置指针（因为vector可能重新分配内存）
+                                if (nominated_idx >= 0) {
+                                    nominated_pair_ = &candidate_pairs_[nominated_idx];
+                                }
+                                
+                                // 根据 ICE 规范：
+                                // - 如果我们是 Controlled 角色，收到的 Binding Request 可能包含 USE-CANDIDATE
+                                // - 或者即使没有 USE-CANDIDATE，第一个成功的连接也应该被使用
+                                // - 在 Aggressive Nomination 模式下，第一个成功的连接就是 nominated
+                                
+                                bool should_nominate = false;
+                                
+                                // 根据 ICE 规范处理 peer-reflexive 候选的提名
+                                
+                                if (mode_ == AgentMode::CONTROLLED) {
+                                    // CONTROLLED 角色：检查是否有 USE-CANDIDATE 属性
+                                    bool has_use_candidate = has_use_candidate_attr(stun_msg->buf, stun_msg->size);
+                                    
+                                    if (has_use_candidate) {
+                                        // 收到 USE-CANDIDATE，必须提名这个候选对
+                                        should_nominate = true;
+                                        LOGI("[ICE-CONTROLLED] Received USE-CANDIDATE, nominating peer-reflexive pair from %s:%d", 
+                                             addr_str, addr->port);
+                                    } else {
+                                        // 没有 USE-CANDIDATE，标记为成功但不提名
+                                        LOGI("[ICE-CONTROLLED] Peer-reflexive pair created for %s:%d (no USE-CANDIDATE, not nominated)",
+                                             addr_str, addr->port);
+                                    }
+                                } else {
+                                    // CONTROLLING 角色：不应该因为收到请求就提名
+                                    // 应该通过连接检查主动选择并发送 USE-CANDIDATE
+                                    LOGI("[ICE-CONTROLLING] Peer-reflexive pair created for %s:%d (will nominate via connectivity check)", 
+                                         addr_str, addr->port);
+                                    // 不立即提名，让连接检查过程决定
+                                    should_nominate = false;
+                                }
+                                
+                                if (should_nominate) {
+                                    // 设置或更新 nominated pair
+                                    if (nominated_pair_ && nominated_pair_->get_state() == IceCandidateState::SUCCEEDED) {
+                                        // 已有成功的 nominated pair
+                                        Address current_remote = nominated_pair_->get_remote()->get_addr();
+                                        char current_addr_str[ADDRSTRLEN];
+                                        addr_to_string(&current_remote, current_addr_str, sizeof(current_addr_str));
+                                        
+                                        // 如果是同一个IP但不同端口，更新到新端口（NAT端口可能变化）
+                                        if (current_remote.family == addr->family && 
+                                            memcmp(&current_remote.sin.sin_addr, &addr->sin.sin_addr, sizeof(struct in_addr)) == 0 &&
+                                            current_remote.port != addr->port) {
+                                            LOGI("NAT port changed from %s:%d to %s:%d, updating nominated pair",
+                                                 current_addr_str, current_remote.port, addr_str, addr->port);
+                                            nominated_pair_ = &candidate_pairs_.back();
+                                        } else {
+                                            LOGI("New successful pair for %s:%d, but keeping current nominated pair %s:%d",
+                                                 addr_str, addr->port, current_addr_str, current_remote.port);
+                                        }
+                                    } else {
+                                        // 设置新的 nominated pair
+                                        nominated_pair_ = &candidate_pairs_.back();
+                                        LOGI("NOMINATED peer-reflexive pair for %s:%d (index=%zu)", 
+                                             addr_str, addr->port, candidate_pairs_.size() - 1);
+                                    }
+                                } else {
+                                    LOGI("Created backup peer-reflexive pair for %s:%d", addr_str, addr->port);
+                                }
+                                
+                                LOGI("Created candidate pair [local %s -> remote %s:%d]",
+                                     local_candidates_[i].to_description().c_str(), addr_str, addr->port);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    LOGE("Failed to send BINDING response to %s:%d", addr_str, addr->port);
+                }
+                
                 binding_request_time_ = ports_get_epoch_time();
+            } else {
+                LOGW("Invalid BINDING request from %s:%d (auth failed)", addr_str, addr->port);
             }
             break;
         default:
+            LOGW("Unknown STUN method %d from %s:%d", stun_msg->stunmethod, addr_str, addr->port);
             break;
     }
 }
@@ -423,9 +715,22 @@ void IceAgent::process_stun_response(StunMessage* stun_msg) {
     switch (stun_msg->stunmethod) {
         case STUN_METHOD_BINDING:
             if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, const_cast<char*>(remote_upwd_.c_str())) == 0) {
+                LOGI("Received valid BINDING response");
                 if (nominated_pair_) {
-                    nominated_pair_->set_state(IceCandidateState::SUCCEEDED);
+                    if (nominated_pair_->get_state() != IceCandidateState::SUCCEEDED) {
+                        nominated_pair_->set_state(IceCandidateState::SUCCEEDED);
+                        
+                        Address remote_addr = nominated_pair_->get_remote()->get_addr();
+                        char addr_str[ADDRSTRLEN];
+                        addr_to_string(&remote_addr, addr_str, sizeof(addr_str));
+                        LOGI("Nominated pair with %s:%d marked as SUCCEEDED (via response)", 
+                             addr_str, remote_addr.port);
+                    }
+                } else {
+                    LOGW("Received BINDING response but no nominated pair set");
                 }
+            } else {
+                LOGW("Invalid BINDING response (auth failed)");
             }
             break;
         default:
@@ -437,26 +742,41 @@ int IceAgent::recv(uint8_t* buf, int len) {
     int ret = -1;
     StunMessage stun_msg;
     Address addr;
+    char addr_str[ADDRSTRLEN];
     
-    if ((ret = socket_recv(&addr, buf, len)) > 0 && stun_probe(buf, len) == 0) {
-        std::memcpy(stun_msg.buf, buf, ret);
-        stun_msg.size = ret;
-        stun_parse_msg_buf(&stun_msg);
+    if ((ret = socket_recv(&addr, buf, len)) > 0) {
+        addr_to_string(&addr, addr_str, sizeof(addr_str));
         
-        switch (stun_msg.stunclass) {
-            case STUN_CLASS_REQUEST:
-                process_stun_request(&stun_msg, &addr);
-                break;
-            case STUN_CLASS_RESPONSE:
-                process_stun_response(&stun_msg);
-                break;
-            case STUN_CLASS_ERROR:
-                break;
-            default:
-                break;
+        if (stun_probe(buf, len) == 0) {
+            std::memcpy(stun_msg.buf, buf, ret);
+            stun_msg.size = ret;
+            stun_parse_msg_buf(&stun_msg);
+            
+            switch (stun_msg.stunclass) {
+                case STUN_CLASS_REQUEST:
+                    process_stun_request(&stun_msg, &addr);
+                    break;
+                case STUN_CLASS_RESPONSE:
+                    process_stun_response(&stun_msg);
+                    break;
+                case STUN_CLASS_ERROR:
+                    LOGW("Received STUN error from %s:%d", addr_str, addr.port);
+                    break;
+                default:
+                    LOGW("Unknown STUN class from %s:%d", addr_str, addr.port);
+                    break;
+            }
+            ret = 0;
+        } else {
+            // 非 STUN 数据包，可能是 DTLS 或 RTP
+            LOGD("Non-STUN packet from %s:%d, size: %d", addr_str, addr.port, ret);
         }
-        ret = 0;
+    } else if (ret < 0 && ret != 0) {
+        // 真正的错误（非超时）
+        LOGE("socket_recv failed with error: %d", ret);
     }
+    // ret == 0 是超时，这是正常的，不需要记录
+    
     return ret;
 }
 
@@ -501,6 +821,15 @@ void IceAgent::set_remote_description(const std::string& description) {
 void IceAgent::update_candidate_pairs() {
     candidate_pairs_.clear();
     
+    // 预先分配空间以避免重新分配导致指针失效
+    // 考虑最坏情况：每个本地候选 * 每个远程候选 + peer-reflexive candidates
+    size_t estimated_pairs = local_candidates_.size() * remote_candidates_.size() + 32;
+    candidate_pairs_.reserve(estimated_pairs);
+    LOGI("Reserved space for %zu candidate pairs", estimated_pairs);
+    
+    char local_addr_str[ADDRSTRLEN];
+    char remote_addr_str[ADDRSTRLEN];
+    
     // Create candidate pairs for matching address families
     for (size_t i = 0; i < local_candidates_.size(); i++) {
         for (size_t j = 0; j < remote_candidates_.size(); j++) {
@@ -509,13 +838,26 @@ void IceAgent::update_candidate_pairs() {
                 auto remote_ptr = std::make_shared<IceCandidate>(remote_candidates_[j]);
                 
                 IceCandidatePair pair(local_ptr, remote_ptr);
+                
+                // 所有候选对初始状态都是FROZEN，由ICE协议决定检查顺序
                 pair.set_state(IceCandidateState::FROZEN);
+                
                 candidate_pairs_.push_back(pair);
             }
         }
     }
     
-    LOGD("candidate pairs num: %d", static_cast<int>(candidate_pairs_.size()));
+    LOGI("Total candidate pairs: %d", static_cast<int>(candidate_pairs_.size()));
+    
+    // 如果有WAITING状态的候选对，立即开始检查
+    for (auto& pair : candidate_pairs_) {
+        if (pair.get_state() == IceCandidateState::WAITING) {
+            nominated_pair_ = &pair;
+            pair.set_state(IceCandidateState::INPROGRESS);
+            LOGI("Starting connectivity check with prioritized pair");
+            break;
+        }
+    }
 }
 
 int IceAgent::connectivity_check() {
@@ -523,8 +865,20 @@ int IceAgent::connectivity_check() {
     uint8_t buf[1400];
     StunMessage msg;
 
-    if (!nominated_pair_ || nominated_pair_->get_state() != IceCandidateState::INPROGRESS) {
-        LOGI("nominated pair is not in progress");
+    if (!nominated_pair_) {
+        LOGE("No nominated pair for connectivity check");
+        return -1;
+    }
+    
+    // 如果已经是 SUCCEEDED，直接返回成功
+    if (nominated_pair_->get_state() == IceCandidateState::SUCCEEDED) {
+        selected_pair_ = nominated_pair_;
+        return 0;
+    }
+    
+    // 只有 INPROGRESS 状态才需要继续检查
+    if (nominated_pair_->get_state() != IceCandidateState::INPROGRESS) {
+        LOGW("Nominated pair in unexpected state: %d", static_cast<int>(nominated_pair_->get_state()));
         return -1;
     }
 
@@ -533,8 +887,7 @@ int IceAgent::connectivity_check() {
     if (nominated_pair_->get_conncheck() % CONNCHECK_PERIOD == 0) {
         Address remote_addr = nominated_pair_->get_remote()->get_addr();
         addr_to_string(&remote_addr, addr_string, sizeof(addr_string));
-        LOGD("send binding request to remote ip: %s, port: %d", addr_string, remote_addr.port);
-        create_binding_request(&msg);
+            create_binding_request(&msg);
         socket_send(&remote_addr, msg.buf, msg.size);
     }
 
@@ -549,28 +902,77 @@ int IceAgent::connectivity_check() {
 }
 
 int IceAgent::select_candidate_pair() {
+    // ICE 规范优先级：
+    // 1. 优先使用 SUCCEEDED 状态的候选对（已验证连通性）
+    // 2. 继续检查 INPROGRESS 的候选对
+    // 3. 选择新的 FROZEN/WAITING 候选对开始检查
+    
+    // Step 1: 如果有 SUCCEEDED 的候选对，优先使用
     for (auto& pair : candidate_pairs_) {
-        if (pair.get_state() == IceCandidateState::FROZEN) {
-            // Nominate this pair
-            nominated_pair_ = &pair;
-            pair.set_conncheck(0);
-            pair.set_state(IceCandidateState::INPROGRESS);
-            return 0;
-        } else if (pair.get_state() == IceCandidateState::INPROGRESS) {
-            pair.set_conncheck(pair.get_conncheck() + 1);
-            if (pair.get_conncheck() < CONNCHECK_MAX) {
-                return 0;
-            }
-            pair.set_state(IceCandidateState::FAILED);
-        } else if (pair.get_state() == IceCandidateState::FAILED) {
-            // Continue to next pair
-        } else if (pair.get_state() == IceCandidateState::SUCCEEDED) {
+        if (pair.get_state() == IceCandidateState::SUCCEEDED) {
             selected_pair_ = &pair;
+            // 对于 CONTROLLED 角色，SUCCEEDED 的对应该被 nominated
+            // 因为这表示已经收到了 Controlling 方的选择
+            if (!nominated_pair_ || nominated_pair_->get_state() != IceCandidateState::SUCCEEDED) {
+                nominated_pair_ = &pair;
+                Address remote_addr = pair.get_remote()->get_addr();
+                char addr_str[ADDRSTRLEN];
+                addr_to_string(&remote_addr, addr_str, sizeof(addr_str));
+                LOGI("Nominated SUCCEEDED pair for %s:%d", addr_str, remote_addr.port);
+            }
             return 0;
         }
     }
     
-    // All candidate pairs are failed
+    // Step 2: 检查 INPROGRESS 的候选对
+    for (auto& pair : candidate_pairs_) {
+        if (pair.get_state() == IceCandidateState::INPROGRESS) {
+            pair.set_conncheck(pair.get_conncheck() + 1);
+            if (pair.get_conncheck() < CONNCHECK_MAX) {
+                // 继续等待连接检查
+                return 0;
+            }
+            // 超时，标记为失败
+            pair.set_state(IceCandidateState::FAILED);
+            LOGD("Candidate pair timeout, marked as FAILED");
+            
+            // 如果这是 nominated_pair_，需要清除
+            if (&pair == nominated_pair_) {
+                nominated_pair_ = nullptr;
+                LOGD("Cleared failed nominated pair");
+            }
+        }
+    }
+    
+    // Step 3: 选择 WAITING 状态的候选对（优先级高于 FROZEN）
+    for (auto& pair : candidate_pairs_) {
+        if (pair.get_state() == IceCandidateState::WAITING) {
+            nominated_pair_ = &pair;
+            pair.set_conncheck(0);
+            pair.set_state(IceCandidateState::INPROGRESS);
+            Address remote_addr = pair.get_remote()->get_addr();
+            char addr_str[ADDRSTRLEN];
+            addr_to_string(&remote_addr, addr_str, sizeof(addr_str));
+            LOGD("Starting check for WAITING pair with %s:%d", addr_str, remote_addr.port);
+            return 0;
+        }
+    }
+    
+    // Step 4: 选择 FROZEN 状态的候选对
+    for (auto& pair : candidate_pairs_) {
+        if (pair.get_state() == IceCandidateState::FROZEN) {
+            nominated_pair_ = &pair;
+            pair.set_conncheck(0);
+            pair.set_state(IceCandidateState::INPROGRESS);
+            Address remote_addr = pair.get_remote()->get_addr();
+            char addr_str[ADDRSTRLEN];
+            addr_to_string(&remote_addr, addr_str, sizeof(addr_str));
+            LOGD("Starting check for FROZEN pair with %s:%d", addr_str, remote_addr.port);
+            return 0;
+        }
+    }
+    
+    // 所有候选对都失败或已检查
     return -1;
 }
 

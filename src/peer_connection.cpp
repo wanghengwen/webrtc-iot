@@ -270,9 +270,14 @@ int PeerConnection::Run() {
                 if (dtls_srtp_.get_state() != rtc::DtlsSrtpState::CONNECTED) {
                     Address* remote_addr = agent_.get_nominated_remote_addr();
                     if (remote_addr) {
-                        LOGI("DTLS handshake with remote addr (port: %d)", remote_addr->port);
+                        char addr_str[ADDRSTRLEN];
+                        addr_to_string(remote_addr, addr_str, sizeof(addr_str));
+                        LOGI("DTLS handshake with nominated remote: %s:%d (attempt %d/30)", 
+                             addr_str, remote_addr->port, dtls_handshake_delay_counter_ + 1);
                     } else {
-                        LOGI("DTLS handshake with null remote addr");
+                        LOGE("DTLS handshake failed: no nominated remote address available");
+                        ports_sleep_ms(100);
+                        continue;
                     }
                     
                     // Limit handshake attempts to prevent infinite loops

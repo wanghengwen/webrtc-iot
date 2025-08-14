@@ -1,9 +1,15 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 
 #include "socket.h"
 #include "utils.h"
+#include "network_config.h"
+
+
 
 int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   int ret = 0;
@@ -61,8 +67,59 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   }
 
   do {
+    // SO_REUSEADDR 在某些平台可能不支持，改用 SO_REUSEPORT
+#ifdef SO_REUSEPORT
+    if ((ret = setsockopt(udp_socket->fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse))) < 0) {
+      LOGW("SO_REUSEPORT failed: %s", strerror(errno));
+    }
+#else
     if ((ret = setsockopt(udp_socket->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))) < 0) {
-      LOGW("reuse failed. ignore");
+      LOGW("SO_REUSEADDR failed: %s", strerror(errno));
+    }
+#endif
+
+    // 增加UDP发送和接收缓冲区大小以防止"Not enough space"错误
+    // ESP32 平台可能对缓冲区大小有限制，尝试不同的值
+    int send_buf_sizes[] = {16384, 8192, 4096};  // 尝试 16KB, 8KB, 4KB
+    int recv_buf_sizes[] = {16384, 8192, 4096};
+    int send_buf_size = 0, recv_buf_size = 0;
+    
+    // 尝试设置发送缓冲区
+    for (int i = 0; i < sizeof(send_buf_sizes)/sizeof(send_buf_sizes[0]); i++) {
+      if (setsockopt(udp_socket->fd, SOL_SOCKET, SO_SNDBUF, 
+                     &send_buf_sizes[i], sizeof(send_buf_sizes[i])) == 0) {
+        send_buf_size = send_buf_sizes[i];
+        LOGI("UDP send buffer size set to %d bytes", send_buf_size);
+        break;
+      }
+    }
+    
+    if (send_buf_size == 0) {
+      LOGW("Failed to set any send buffer size, using system default");
+    }
+    
+    // 尝试设置接收缓冲区
+    for (int i = 0; i < sizeof(recv_buf_sizes)/sizeof(recv_buf_sizes[0]); i++) {
+      if (setsockopt(udp_socket->fd, SOL_SOCKET, SO_RCVBUF, 
+                     &recv_buf_sizes[i], sizeof(recv_buf_sizes[i])) == 0) {
+        recv_buf_size = recv_buf_sizes[i];
+        LOGI("UDP receive buffer size set to %d bytes", recv_buf_size);
+        break;
+      }
+    }
+    
+    if (recv_buf_size == 0) {
+      LOGW("Failed to set any receive buffer size, using system default");
+    }
+    
+    // 获取实际设置的缓冲区大小
+    socklen_t optlen = sizeof(send_buf_size);
+    if (getsockopt(udp_socket->fd, SOL_SOCKET, SO_SNDBUF, &send_buf_size, &optlen) == 0) {
+      LOGI("Actual send buffer size: %d bytes", send_buf_size);
+    }
+    optlen = sizeof(recv_buf_size);
+    if (getsockopt(udp_socket->fd, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, &optlen) == 0) {
+      LOGI("Actual receive buffer size: %d bytes", recv_buf_size);
     }
 
     if ((ret = bind(udp_socket->fd, sa, sock_len)) < 0) {
@@ -125,12 +182,13 @@ int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, 
   }
 
   if ((ret = sendto(udp_socket->fd, buf, len, 0, sa, sock_len)) < 0) {
-    LOGE("Failed to sendto: %s", strerror(errno));
+    LOGE("Failed to sendto: %s (errno=%d)", strerror(errno), errno);
     return -1;
   }
-
+  
   return ret;
 }
+
 
 int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int len) {
   struct sockaddr_in6 sin6;

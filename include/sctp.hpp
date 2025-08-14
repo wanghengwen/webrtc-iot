@@ -13,9 +13,7 @@
 #include "dtls_srtp.hpp"
 
 #if CONFIG_USE_USRSCTP
-extern "C" {
 #include <usrsctp.h>
-}
 #endif
 
 namespace rtc {

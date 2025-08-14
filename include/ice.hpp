@@ -6,9 +6,7 @@
 #include <memory>
 #include "address.h"
 
-extern "C" {
 #include "stun.h"
-}
 
 #define ICE_UFRAG_LENGTH 256
 #define ICE_UPWD_LENGTH 256
